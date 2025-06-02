@@ -1,87 +1,222 @@
+# .github/workflows/cicd.yaml
 name: Deploy Application Docker Image to EC2 instance
 
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1  # Change to your preferred region
+  ECR_REPOSITORY: dr-chat-app
+  ECS_SERVICE: dr-chat-service
+  ECS_CLUSTER: dr-chat-cluster
 
 jobs:
   Continuous-Integration:
     runs-on: ubuntu-latest
     
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
+        uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: latest
+          IMAGE_TAG: ${{ github.sha }}
         run: |
+          # Build the Docker image
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Push both tagged and latest images
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Set output for next job
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
   Continuous-Deployment:
     needs: Continuous-Integration
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v1
-
-      - name: Stop and remove existing container
+      - name: Deploy to EC2 via SSM
         run: |
-          docker stop dr-chat-app || true
-          docker rm dr-chat-app || true
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "#!/bin/bash",
+              "set -e",
+              "echo \"Starting deployment...\"",
+              
+              "# Configure AWS CLI for EC2 instance",
+              "aws configure set region ${{ env.AWS_REGION }}",
+              
+              "# Login to ECR",
+              "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com",
+              
+              "# Stop and remove existing container",
+              "docker stop dr-chat-app || true",
+              "docker rm dr-chat-app || true",
+              
+              "# Pull latest image",
+              "docker pull ${{ needs.Continuous-Integration.outputs.image }}",
+              
+              "# Run new container",
+              "docker run -d \\",
+              "  --name dr-chat-app \\",
+              "  -p 80:8000 \\",
+              "  -e OPENAI_API_KEY=\"${{ secrets.OPENAI_API_KEY }}\" \\",
+              "  -e PINECONE_API_KEY=\"${{ secrets.PINECONE_API_KEY }}\" \\",
+              "  -e PINECONE_ENVIRONMENT=\"${{ secrets.PINECONE_ENVIRONMENT }}\" \\",
+              "  -e PINECONE_INDEX_NAME=\"${{ secrets.PINECONE_INDEX_NAME }}\" \\",
+              "  -e AWS_DEFAULT_REGION=\"${{ env.AWS_REGION }}\" \\",
+              "  --restart unless-stopped \\",
+              "  ${{ needs.Continuous-Integration.outputs.image }}",
+              
+              "# Clean up old images",
+              "docker image prune -f",
+              
+              "# Health check",
+              "sleep 10",
+              "curl -f http://localhost || exit 1",
+              
+              "echo \"Deployment completed successfully!\""
+            ]' \
+            --targets "Key=tag:Name,Values=dr-chat-ec2" \
+            --max-concurrency "1" \
+            --max-errors "0" \
+            --timeout-seconds "300"
 
-      - name: Pull latest image from ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: latest
-        run: |
-          docker pull $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+---
 
-      - name: Run Docker Image to serve users
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
-          IMAGE_TAG: latest
-        run: |
-          docker run -d \
-            --name dr-chat-app \
-            -p 8000:8000 \
-            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
-            -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
-            -e PINECONE_ENVIRONMENT="${{ secrets.PINECONE_ENVIRONMENT }}" \
-            -e PINECONE_INDEX_NAME="${{ secrets.PINECONE_INDEX_NAME }}" \
-            --restart unless-stopped \
-            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+# AWS Infrastructure Setup Commands
+# Run these commands to set up your AWS infrastructure
 
-      - name: Clean up old images
-        run: |
-          docker image prune -f
+# 1. Create ECR Repository
+aws ecr create-repository \
+    --repository-name dr-chat-app \
+    --region us-east-1
+
+# 2. Create IAM Role for EC2
+aws iam create-role \
+    --role-name EC2-ECR-Role \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }'
+
+# 3. Create IAM Policy for ECR Access
+aws iam create-policy \
+    --policy-name ECR-Access-Policy \
+    --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ecr:GetAuthorizationToken",
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:BatchGetImage"
+                ],
+                "Resource": "*"
+            }
+        ]
+    }'
+
+# 4. Attach policies to role
+aws iam attach-role-policy \
+    --role-name EC2-ECR-Role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+aws iam attach-role-policy \
+    --role-name EC2-ECR-Role \
+    --policy-arn arn:aws:iam::YOUR_ACCOUNT_ID:policy/ECR-Access-Policy
+
+# 5. Create Instance Profile
+aws iam create-instance-profile \
+    --instance-profile-name EC2-ECR-Profile
+
+aws iam add-role-to-instance-profile \
+    --instance-profile-name EC2-ECR-Profile \
+    --role-name EC2-ECR-Role
+
+# 6. Create Security Group
+aws ec2 create-security-group \
+    --group-name dr-chat-sg \
+    --description "Security group for Dr Chat application"
+
+# Get the security group ID from the output and use it in the next command
+aws ec2 authorize-security-group-ingress \
+    --group-id sg-xxxxxxxxx \
+    --protocol tcp \
+    --port 80 \
+    --cidr 0.0.0.0/0
+
+aws ec2 authorize-security-group-ingress \
+    --group-id sg-xxxxxxxxx \
+    --protocol tcp \
+    --port 22 \
+    --cidr 0.0.0.0/0
+
+# 7. Launch EC2 Instance
+aws ec2 run-instances \
+    --image-id ami-0c02fb55956c7d316 \
+    --count 1 \
+    --instance-type t3.medium \
+    --key-name your-key-pair \
+    --security-group-ids sg-xxxxxxxxx \
+    --iam-instance-profile Name=EC2-ECR-Profile \
+    --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=dr-chat-ec2}]' \
+    --user-data '#!/bin/bash
+    yum update -y
+    yum install -y docker
+    systemctl start docker
+    systemctl enable docker
+    usermod -a -G docker ec2-user
+    
+    # Install AWS CLI v2
+    curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    unzip awscliv2.zip
+    ./aws/install
+    
+    # Install SSM Agent (usually pre-installed on Amazon Linux 2)
+    yum install -y amazon-ssm-agent
+    systemctl enable amazon-ssm-agent
+    systemctl start amazon-ssm-agent'
