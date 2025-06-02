@@ -1,0 +1,8 @@
+Generative_AI_medical_bot.egg-info
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info
